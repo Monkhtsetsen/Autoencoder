@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="mn">
+<head>
+  <meta charset="UTF-8" />
+  <title>Autoencoder Result</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="header">
+      <h1>Reconstruction Result</h1>
+      <p>Original vs Reconstructed (128×128)</p>
+    </header>
+
+    <main class="card grid-2">
+      <div class="image-block">
+        <h2>Original</h2>
+        <img src="{{ original_url }}" alt="Original image" />
+      </div>
+
+      <div class="image-block">
+        <h2>Reconstructed</h2>
+        <img src="{{ recon_url }}" alt="Reconstructed image" />
+      </div>
+
+      <div class="actions">
+        <a class="btn-secondary" href="{{ url_for('index') }}">Дахин турших</a>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <span>Буулгасан latent representation-оос зураг сэргээж байна.</span>
+    </footer>
+  </div>
+</body>
+</html>
