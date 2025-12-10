@@ -11,18 +11,27 @@ import torch
 from torchvision import transforms as T
 from torchvision.transforms.functional import to_pil_image
 
-from model import create_model, IMG_SIZE, IN_CHANNELS, LATENT_DIM, MODEL_TYPE, device
+from model import UNetDenoiser  # UNet-DAE model
 
-WEIGHTS_PATH = f"weights/mnist_{MODEL_TYPE}_denoiser_{IMG_SIZE}.pth"
-CURVE_PATH = "training_curve.png"
-SAMPLES_PATH = "samples.png"
+# ---- basic config ----
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+IMG_SIZE = 28          # MNIST size
+IN_CHANNELS = 1
+LATENT_DIM = 256       # bottleneck pooled to 256-D vector
+MODEL_TYPE = "unet_dae"
+
+WEIGHTS_PATH = "checkpoints_unet_dae/unet_dae_best.pth"
+CURVE_PATH = "training_curve.png"   # байвал харагдана, байхгүй бол зүгээр алгасна
+SAMPLES_PATH = "samples.png"        # демо samples зураг (хүсвэл)
 
 app = Flask(__name__)
 
 resize_to_model = T.Resize((IMG_SIZE, IMG_SIZE))
 to_tensor = T.ToTensor()
 
-model = create_model()
+# ---- load model ----
+model = UNetDenoiser().to(device)
 if os.path.exists(WEIGHTS_PATH):
     state = torch.load(WEIGHTS_PATH, map_location=device)
     model.load_state_dict(state)
@@ -31,6 +40,8 @@ else:
     print(f"[WARN] {WEIGHTS_PATH} not found. Run train.py first.")
 model.eval()
 
+
+# ------------- helpers -------------
 
 def pil_to_data_url(img: Image.Image) -> str:
     buf = io.BytesIO()
@@ -56,28 +67,31 @@ def load_curve(path):
 
 
 def run_model_on_pil(pil_img: Image.Image):
-    # 1) grayscale + resize to model input size
+    """
+    Input: arbitrary PIL image
+    Output: upscaled original/denoised/errormap PIL images + latent vector + metrics
+    """
+    # grayscale + resize
     gray = pil_img.convert("L")
     gray = resize_to_model(gray)
 
     x = to_tensor(gray)  # (1,H,W) in [0,1]
 
-    # invert if background is white-ish (MNIST-style)
+    # invert if white background (MNIST style)
     if x.mean().item() > 0.5:
         x = 1.0 - x
 
     x = x.unsqueeze(0).to(device)  # (1,1,H,W)
 
     with torch.no_grad():
-        if getattr(model, "is_vae", False):
-            recon, z, mu, logvar = model(x)
-        else:
-            recon, z = model(x)
+        # UNetDenoiser forward(return_latent=True) -> (recon, latent)
+        recon, z = model(x, return_latent=True)
 
     metrics = compute_metrics(x, recon)
+
     x_cpu = x[0].cpu().clamp(0.0, 1.0)
     recon_cpu = recon[0].cpu().clamp(0.0, 1.0)
-    z_cpu = z[0].cpu()
+    z_cpu = z[0].cpu()  # (LATENT_DIM,)
 
     # error map
     diff = (x_cpu - recon_cpu).abs()
@@ -85,13 +99,16 @@ def run_model_on_pil(pil_img: Image.Image):
     if max_val > 1e-8:
         diff = diff / max_val
 
-    # upscale for nicer display
+    # upscale for display
     upscale = T.Resize((256, 256))
     orig_pil = upscale(to_pil_image(x_cpu))
     recon_pil = upscale(to_pil_image(recon_cpu))
     diff_pil = upscale(to_pil_image(diff))
 
     return orig_pil, recon_pil, diff_pil, z_cpu, metrics
+
+
+# ------------- HTML -------------
 
 
 HTML_PAGE = """
@@ -196,7 +213,7 @@ HTML_PAGE = """
       min-height: 220px;
       border: 1px solid #111827;
     }
-    .img-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); }
+    .img-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); width: 100%; }
     .img-wrapper img { max-width: 100%; height: auto; display: block; }
     .metric-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
     .metric-pill {
@@ -275,7 +292,7 @@ HTML_PAGE = """
       {% if orig_img and recon_img %}
         <div class="grid-main">
           <div class="panel">
-            <h2>Original vs Denoised vs Error map</h2>
+            <h2>ORIGINAL vs DENOISED vs ERROR MAP</h2>
             <small>Original (resize), model output, болон |x − x̂|-ийн normalized heatmap.</small>
             <div class="img-wrapper img-grid-3">
               <img src="{{ orig_img }}" alt="original" />
@@ -306,8 +323,7 @@ HTML_PAGE = """
               </div>
             </details>
             <div class="status">
-              VAE горимд latent-оос random sample авч шинэ дүрс generate хийж болно –
-              энэ demo-д бол зөвхөн denoising дээр төвлөрч байна.
+              UNet-DAE нь latent feature-ээрээ noisy ба clean дүрсний бүтцийг ялгаж сурсан байна.
             </div>
           </div>
         </div>
@@ -340,6 +356,8 @@ HTML_PAGE = """
 </html>
 """
 
+
+# ------------- routes -------------
 
 @app.route("/", methods=["GET"])
 def index():

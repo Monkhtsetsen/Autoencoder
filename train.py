@@ -1,298 +1,164 @@
 # train.py
 import os
 import math
-from typing import Tuple, Dict
-
 import torch
-from torch import optim
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
-from torchvision import datasets, transforms as T
-import matplotlib.pyplot as plt
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, utils
 
-from model import create_model, IMG_SIZE, IN_CHANNELS, LATENT_DIM, MODEL_TYPE, device
+from model import UNetDenoiser
 
-# ------------------------
-# Dataset: high-res noisy handwriting
-# ------------------------
 
-class NoisyMNISTHighRes(Dataset):
+# ---------------- SSIM ----------------
+def ssim_index(x, y, C1=0.01**2, C2=0.03**2):
+    mu_x = torch.mean(x, dim=[2, 3], keepdim=True)
+    mu_y = torch.mean(y, dim=[2, 3], keepdim=True)
+
+    sigma_x = torch.var(x, dim=[2, 3], unbiased=False, keepdim=True)
+    sigma_y = torch.var(y, dim=[2, 3], unbiased=False, keepdim=True)
+    sigma_xy = torch.mean((x - mu_x) * (y - mu_y), dim=[2, 3], keepdim=True)
+
+    numerator = (2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)
+    denominator = (mu_x**2 + mu_y**2 + C1) * (sigma_x + sigma_y + C2)
+
+    return (numerator / (denominator + 1e-8)).mean()
+
+
+class CombinedLoss(nn.Module):
     """
-    MNIST -> resize to IMG_SIZE x IMG_SIZE, add blur + Gaussian noise.
-    __getitem__ returns (noisy_img, clean_img)
+    total_loss = α*MSE + β*(1-SSIM)
     """
-
-    def __init__(self, root: str = "data", train: bool = True,
-                 noise_std: float = 0.25):
+    def __init__(self, alpha=.5, beta=.5):
         super().__init__()
+        self.mse = nn.MSELoss()
+        self.alpha = alpha
+        self.beta = beta
 
-        transform_clean = T.Compose([
-            T.Resize((IMG_SIZE, IMG_SIZE)),
-            T.ToTensor(),               # [0,1]
-        ])
-
-        self.base = datasets.MNIST(
-            root=root,
-            train=train,
-            download=True,
-            transform=transform_clean,
-        )
-
-        self.noise_std = noise_std
-        # blur + mild affine, similar to "a bit shaky / blurry" handwriting
-        self.augment = T.Compose([
-            T.GaussianBlur(kernel_size=3, sigma=(0.5, 1.2)),
-            T.RandomAffine(
-                degrees=5,
-                translate=(0.03, 0.03),
-                scale=(0.95, 1.05),
-            ),
-        ])
-
-    def __len__(self):
-        return len(self.base)
-
-    def __getitem__(self, idx: int):
-        clean, _ = self.base[idx]           # (1,H,W)
-        aug = self.augment(clean)
-
-        # random noise strength per sample → more robust
-        factor = 0.5 + torch.rand(1).item()   # [0.5, 1.5]
-        noise = torch.randn_like(aug) * self.noise_std * factor
-
-        noisy = (aug + noise).clamp(0.0, 1.0)
-        return noisy, clean
+    def forward(self, pred, target):
+        mse_loss = self.mse(pred, target)
+        ssim_val = ssim_index(pred, target)
+        ssim_loss = 1 - ssim_val
+        total = self.alpha * mse_loss + self.beta * ssim_loss
+        return total, mse_loss, ssim_val
 
 
-# ------------------------
-# Metrics & perceptual loss
-# ------------------------
-
-def _gaussian_window(window_size: int, sigma: float,
-                     device, dtype) -> torch.Tensor:
-    coords = torch.arange(window_size, dtype=dtype, device=device) - window_size // 2
-    gauss_1d = torch.exp(- (coords ** 2) / (2 * sigma ** 2))
-    gauss_1d = gauss_1d / gauss_1d.sum()
-    gauss_2d = gauss_1d.unsqueeze(1) @ gauss_1d.unsqueeze(0)
-    window = gauss_2d.unsqueeze(0).unsqueeze(0)  # (1,1,K,K)
-    return window
-
-
-def ssim(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+# -------------- Noise ---------------
+def add_noise(img, sigma=0.4, sp=0.01):
     """
-    Structural Similarity Index (SSIM) for grayscale images in [0,1].
-    x, y: (B, C, H, W)
-    Returns mean SSIM over batch.
+    Gaussian + бага зэрэг salt-and-pepper noise
     """
-    assert x.shape == y.shape, "SSIM: shapes must match"
-
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
-
-    B, C, H, W = x.shape
-    window = _gaussian_window(
-        window_size=window_size,
-        sigma=1.5,
-        device=x.device,
-        dtype=x.dtype,
-    )
-    window = window.expand(C, 1, window_size, window_size)
-
-    mu_x = F.conv2d(x, window, padding=window_size // 2, groups=C)
-    mu_y = F.conv2d(y, window, padding=window_size // 2, groups=C)
-
-    mu_x2 = mu_x * mu_x
-    mu_y2 = mu_y * mu_y
-    mu_xy = mu_x * mu_y
-
-    sigma_x2 = F.conv2d(x * x, window, padding=window_size // 2, groups=C) - mu_x2
-    sigma_y2 = F.conv2d(y * y, window, padding=window_size // 2, groups=C) - mu_y2
-    sigma_xy = F.conv2d(x * y, window, padding=window_size // 2, groups=C) - mu_xy
-
-    ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / (
-        (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2)
-    )
-    return ssim_map.mean()
+    g = img + torch.randn_like(img) * sigma
+    rand = torch.rand_like(g)
+    g[rand < sp] = 0.0
+    g[rand > 1 - sp] = 1.0
+    return torch.clamp(g, 0, 1)
 
 
-def mse_loss_with_ssim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """
-    L = 0.7 * MSE + 0.3 * (1 - SSIM)
-    """
-    mse = torch.mean((x - y) ** 2)
-    ssim_val = ssim(x, y)
-    loss = 0.7 * mse + 0.3 * (1.0 - ssim_val)
-    return loss
-
-
-def psnr(x: torch.Tensor, y: torch.Tensor) -> float:
-    mse = torch.mean((x - y) ** 2).item()
-    if mse <= 1e-12:
-        return float("inf")
-    return 10.0 * math.log10(1.0 / mse)
-
-
-# ------------------------
-# Training / Eval loops
-# ------------------------
-
-def train_epoch(model, loader, optimizer, epoch, total_epochs) -> Dict:
-    model.train()
-    totals = {"loss": 0.0, "psnr": 0.0}
-    n_batches = 0
-
-    for noisy, clean in loader:
-        noisy = noisy.to(device)
-        clean = clean.to(device)
-
-        optimizer.zero_grad()
-
-        recon, z = model(noisy)
-        loss = mse_loss_with_ssim(recon, clean)
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-
-        totals["loss"] += loss.item()
-        totals["psnr"] += psnr(recon.detach(), clean)
-        n_batches += 1
-
-    for k in totals.keys():
-        totals[k] /= n_batches
-
-    print(f"[Train] Epoch {epoch}/{total_epochs} | "
-          f"loss={totals['loss']:.6f} | psnr={totals['psnr']:.2f} dB")
-
-    return totals
-
-
-def eval_epoch(model, loader, epoch, total_epochs) -> Dict:
+# ---------- save samples (optional, nice to have) ----------
+@torch.no_grad()
+def save_samples(model, data_loader, device, epoch, save_dir, num_samples=8):
     model.eval()
-    totals = {"loss": 0.0, "psnr": 0.0}
-    n_batches = 0
+    imgs, _ = next(iter(data_loader))
+    imgs = imgs.to(device)[:num_samples]
+    noisy = add_noise(imgs)
 
-    with torch.no_grad():
-        for noisy, clean in loader:
-            noisy = noisy.to(device)
-            clean = clean.to(device)
+    preds = model(noisy)
 
-            recon, z = model(noisy)
-            loss = mse_loss_with_ssim(recon, clean)
+    grid = torch.cat([imgs, noisy, preds], dim=0)
+    grid = utils.make_grid(grid, nrow=num_samples, pad_value=1.0)
 
-            totals["loss"] += loss.item()
-            totals["psnr"] += psnr(recon, clean)
-            n_batches += 1
-
-    for k in totals.keys():
-        totals[k] /= n_batches
-
-    print(f"[Valid] Epoch {epoch}/{total_epochs} | "
-          f"loss={totals['loss']:.6f} | psnr={totals['psnr']:.2f} dB")
-
-    return totals
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, f"samples_epoch_{epoch:03d}.png")
+    utils.save_image(grid, out_path)
+    print(f"   → Saved sample grid to {out_path}")
 
 
-# ------------------------
-# Visualization helpers
-# ------------------------
-
-def save_training_curve(history: dict, path: str = "training_curve.png"):
-    epochs = range(1, len(history["train_loss"]) + 1)
-    plt.figure(figsize=(8, 4))
-    plt.plot(epochs, history["train_loss"], label="Train Loss")
-    plt.plot(epochs, history["val_loss"], label="Val Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Total Loss")
-    plt.title(f"{MODEL_TYPE.upper()} Denoiser – {IMG_SIZE}x{IMG_SIZE}")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
-    print(f"[INFO] Saved training curve to {path}")
-
-
-def save_sample_grid(model, loader, path: str = "samples.png", n_samples: int = 4):
-    model.eval()
-    noisy_batch, clean_batch = next(iter(loader))
-    noisy_batch = noisy_batch[:n_samples].to(device)
-    clean_batch = clean_batch[:n_samples].to(device)
-
-    with torch.no_grad():
-        recon_batch, _ = model(noisy_batch)
-
-    noisy = noisy_batch.cpu().numpy()
-    clean = clean_batch.cpu().numpy()
-    recon = recon_batch.cpu().numpy()
-
-    fig, axes = plt.subplots(3, n_samples, figsize=(2.2 * n_samples, 6))
-    titles = ["Noisy", "Denoised", "Clean"]
-
-    for i in range(n_samples):
-        axes[0, i].imshow(noisy[i, 0], cmap="gray")
-        axes[0, i].axis("off")
-        axes[0, i].set_title(f"{titles[0]} #{i+1}", fontsize=9)
-
-        axes[1, i].imshow(recon[i, 0], cmap="gray")
-        axes[1, i].axis("off")
-        axes[1, i].set_title(titles[1], fontsize=9)
-
-        axes[2, i].imshow(clean[i, 0], cmap="gray")
-        axes[2, i].axis("off")
-        axes[2, i].set_title(titles[2], fontsize=9)
-
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
-    print(f"[INFO] Saved sample grid to {path}")
-
-
-# ------------------------
-# Main
-# ------------------------
-
+# -------------- TRAIN ---------------
 def main():
-    os.makedirs("weights", exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
 
-    full_train = NoisyMNISTHighRes(root="data", train=True, noise_std=0.25)
+    ckpt_dir = "checkpoints_unet_dae"
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-    # use subset so training stays reasonable
-    max_samples = 20000
-    if len(full_train) > max_samples:
-        full_train, _ = random_split(full_train, [max_samples, len(full_train) - max_samples])
-        print(f"[INFO] Using subset of MNIST: {max_samples} samples")
+    # dataset (MNIST 28×28 grayscale)
+    transform = transforms.ToTensor()
+    train_ds = datasets.MNIST("data", train=True, download=True, transform=transform)
+    test_ds  = datasets.MNIST("data", train=False, download=True, transform=transform)
 
-    train_size = int(0.9 * len(full_train))
-    val_size = len(full_train) - train_size
-    train_ds, val_ds = random_split(full_train, [train_size, val_size])
+    # num_workers=0 → Windows дээр илүү safe
+    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0)
+    test_loader  = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0)
 
-    batch_size = 64 if device.type == "cpu" else 128
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    # model
+    model = UNetDenoiser().to(device)
 
-    model = create_model()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[INFO] Trainable parameters: {n_params}")
 
-    num_epochs = 10
-    best_val_loss = float("inf")
-    history = {"train_loss": [], "val_loss": []}
-    weights_path = f"weights/mnist_{MODEL_TYPE}_denoiser_{IMG_SIZE}.pth"
+    # optimizer → AdamW
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
-    for epoch in range(1, num_epochs + 1):
-        train_stats = train_epoch(model, train_loader, optimizer, epoch, num_epochs)
-        val_stats = eval_epoch(model, val_loader, epoch, num_epochs)
+    # scheduler → StepLR (PyTorch бүх хувилбар дээр ажилладаг, энгийн)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=5,   # 5 epoch тутам LR-ийг бууруулна
+        gamma=0.5
+    )
 
-        history["train_loss"].append(train_stats["loss"])
-        history["val_loss"].append(val_stats["loss"])
+    criterion = CombinedLoss(alpha=.5, beta=.5)
 
-        if val_stats["loss"] < best_val_loss:
-            best_val_loss = val_stats["loss"]
-            torch.save(model.state_dict(), weights_path)
-            print(f"[SAVE] New best model (val_loss={best_val_loss:.6f}) → {weights_path}")
+    best_loss = math.inf
+    epochs = 20
 
-    save_training_curve(history, "training_curve.png")
-    save_sample_grid(model, val_loader, "samples.png", n_samples=4)
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        total_mse = 0.0
+        total_ssim = 0.0
+
+        for imgs, _ in train_loader:
+            imgs = imgs.to(device)
+            noisy = add_noise(imgs)
+
+            preds = model(noisy)
+
+            loss, mse_val, ssim_val = criterion(preds, imgs)
+
+            optimizer.zero_grad()
+            loss.backward()
+
+            # gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            optimizer.step()
+
+            bs = imgs.size(0)
+            total_loss += loss.item() * bs
+            total_mse  += mse_val.item() * bs
+            total_ssim += ssim_val.item() * bs
+
+        scheduler.step()
+
+        train_loss = total_loss / len(train_ds)
+        train_mse  = total_mse / len(train_ds)
+        train_ssim = total_ssim / len(train_ds)
+
+        print(f"[Epoch {epoch:02d}/{epochs}] "
+              f"Loss={train_loss:.6f} | MSE={train_mse:.6f} | SSIM={train_ssim:.4f}")
+
+        # save best model
+        if train_loss < best_loss:
+            best_loss = train_loss
+            ckpt_path = os.path.join(ckpt_dir, "unet_dae_best.pth")
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"   → Saved BEST model to {ckpt_path}")
+
+        # save visualization every 5 epochs
+        if epoch % 5 == 0:
+            save_samples(model, test_loader, device, epoch, ckpt_dir)
+
+    print("\nTraining DONE.")
 
 
 if __name__ == "__main__":

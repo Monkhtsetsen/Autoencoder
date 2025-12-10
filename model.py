@@ -1,167 +1,114 @@
-# model.py
-import math
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
 
-# ------------------------
-# Global config
-# ------------------------
-IMG_SIZE = 64          # 64 is fine for MNIST-style digits
-IN_CHANNELS = 1        # grayscale
-LATENT_DIM = 256       # size of latent vector shown in UI
-MODEL_TYPE = "ae"      # we now use a deterministic denoising AE
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def _check_img_size(img_size: int):
-    if 2 ** int(math.log2(img_size)) != img_size:
-        raise ValueError("IMG_SIZE must be power-of-two (32, 64, 128, ...)")
-    if img_size < 32:
-        raise ValueError("IMG_SIZE should be >= 32 for this architecture.")
-
-
-# ------------------------
-# Basic building blocks
-# ------------------------
 
 class ConvBlock(nn.Module):
-    """
-    Conv -> BN -> ReLU (×2)
-    """
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(0.2, inplace=True),
         )
 
     def forward(self, x):
-        return self.net(x)
+        return self.block(x)
 
 
-# ------------------------
-# U-Net style denoiser
-# ------------------------
+class Down(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.down = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.conv = ConvBlock(out_ch, out_ch)
+
+    def forward(self, x):
+        x = self.down(x)
+        return self.conv(x)
+
+
+class Up(nn.Module):
+    def __init__(self, in_ch, out_ch, skip_ch):
+        """
+        in_ch  = channels of input feature (from deeper level)
+        out_ch = channels after upsample + conv
+        skip_ch = channels of skip connection feature
+        """
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv = ConvBlock(out_ch + skip_ch, out_ch)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+
+        # If shapes ever misalign by 1 px (odd sizes), pad to match skip
+        if x.shape[-1] != skip.shape[-1] or x.shape[-2] != skip.shape[-2]:
+            diff_y = skip.shape[-2] - x.shape[-2]
+            diff_x = skip.shape[-1] - x.shape[-1]
+            x = F.pad(
+                x,
+                [diff_x // 2, diff_x - diff_x // 2,
+                 diff_y // 2, diff_y - diff_y // 2]
+            )
+
+        # concat along channel dim
+        x = torch.cat([skip, x], dim=1)
+        return self.conv(x)
+
 
 class UNetDenoiser(nn.Module):
-    """
-    Lightweight U-Net for denoising digits.
-
-    Input:  (B, 1, H, W)
-    Output: (B, 1, H, W)  in [0,1]
-    Latent: (B, LATENT_DIM)
-    """
-
-    def __init__(self,
-                 img_size: int = IMG_SIZE,
-                 in_channels: int = IN_CHANNELS,
-                 base_channels: int = 32,
-                 latent_dim: int = LATENT_DIM):
+    def __init__(self):
         super().__init__()
-        _check_img_size(img_size)
 
-        self.img_size = img_size
-        self.in_channels = in_channels
-        self.latent_dim = latent_dim
-        self.is_vae = False   # so train.py knows we are plain AE
+        # Encoder
+        self.in_conv = ConvBlock(1, 32)    # 1x28x28 -> 32x28x28
+        self.down1   = Down(32, 64)        # 32x28x28 -> 64x14x14
+        self.down2   = Down(64, 128)       # 64x14x14 -> 128x7x7
 
-        # ------- Encoder -------
-        self.enc1 = ConvBlock(in_channels, base_channels)         # 64x64 -> 64x64
-        self.down1 = nn.Conv2d(base_channels, base_channels * 2,
-                               kernel_size=3, stride=2, padding=1)  # 64 -> 32
+        # Bottleneck
+        self.bottleneck = ConvBlock(128, 256)  # 128x7x7 -> 256x7x7
 
-        self.enc2 = ConvBlock(base_channels * 2, base_channels * 2)  # 32x32
-        self.down2 = nn.Conv2d(base_channels * 2, base_channels * 4,
-                               kernel_size=3, stride=2, padding=1)  # 32 -> 16
+        # Decoder (note skip_ch sizes!)
+        self.up1 = Up(in_ch=256, out_ch=128, skip_ch=64)  # skip x2 (64ch, 14x14)
+        self.up2 = Up(in_ch=128, out_ch=64,  skip_ch=32)  # skip x1 (32ch, 28x28)
 
-        self.enc3 = ConvBlock(base_channels * 4, base_channels * 4)  # 16x16
-        self.down3 = nn.Conv2d(base_channels * 4, base_channels * 8,
-                               kernel_size=3, stride=2, padding=1)  # 16 -> 8
+        # Output head
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(32, 1, 1),
+            nn.Sigmoid()
+        )
 
-        # bottleneck 8x8
-        self.bottleneck = ConvBlock(base_channels * 8, base_channels * 8)
+        # Global latent vector (for fun / future use)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
 
-        # latent from global average pooled bottleneck
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.fc_latent = nn.Linear(base_channels * 8, latent_dim)
+    def forward(self, x, return_latent=False):
+        # Encoder
+        x1 = self.in_conv(x)   # [B, 32, 28, 28]
+        x2 = self.down1(x1)    # [B, 64, 14, 14]
+        x3 = self.down2(x2)    # [B, 128, 7, 7]
 
-        # ------- Decoder -------
-        self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4,
-                                      kernel_size=3, stride=2, padding=1, output_padding=1)  # 8 -> 16
-        self.dec3 = ConvBlock(base_channels * 4 + base_channels * 4, base_channels * 4)
+        # Bottleneck
+        b = self.bottleneck(x3)  # [B, 256, 7, 7]
 
-        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2,
-                                      kernel_size=3, stride=2, padding=1, output_padding=1)  # 16 -> 32
-        self.dec2 = ConvBlock(base_channels * 2 + base_channels * 2, base_channels * 2)
+        # Latent vector
+        latent = self.global_pool(b).view(b.size(0), -1)  # [B, 256]
 
-        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels,
-                                      kernel_size=3, stride=2, padding=1, output_padding=1)  # 32 -> 64
-        self.dec1 = ConvBlock(base_channels + base_channels, base_channels)
+        # Decoder (proper skip levels)
+        u1 = self.up1(b, x2)   # [B, 128, 14, 14]
+        u2 = self.up2(u1, x1)  # [B, 64,  28, 28]
 
-        # final prediction
-        self.final_conv = nn.Conv2d(base_channels, in_channels, kernel_size=3, padding=1)
-        self.final_act = nn.Sigmoid()
+        out = self.out_conv(u2)  # [B, 1, 28, 28]
 
-    def encode(self, x: torch.Tensor):
-        # encoder with skip connections
-        x1 = self.enc1(x)                  # (B, 32, 64, 64)
-        x2_in = torch.relu(self.down1(x1))
-        x2 = self.enc2(x2_in)              # (B, 64, 32, 32)
-
-        x3_in = torch.relu(self.down2(x2))
-        x3 = self.enc3(x3_in)              # (B, 128, 16, 16)
-
-        x4_in = torch.relu(self.down3(x3))
-        bottleneck = self.bottleneck(x4_in)  # (B, 256, 8, 8)
-
-        # latent vector via global avg pool
-        gap = self.gap(bottleneck).view(bottleneck.size(0), -1)  # (B, 256)
-        z = self.fc_latent(gap)                                  # (B, LATENT_DIM)
-
-        return (x1, x2, x3, bottleneck), z
-
-    def decode(self, skips, z: torch.Tensor):
-        x1, x2, x3, bottleneck = skips
-
-        # decoder with skip concatenations
-        d3 = self.up3(bottleneck)          # (B, 128, 16, 16)
-        d3 = torch.cat([d3, x3], dim=1)    # concat skip
-        d3 = self.dec3(d3)
-
-        d2 = self.up2(d3)                  # (B, 64, 32, 32)
-        d2 = torch.cat([d2, x2], dim=1)
-        d2 = self.dec2(d2)
-
-        d1 = self.up1(d2)                  # (B, 32, 64, 64)
-        d1 = torch.cat([d1, x1], dim=1)
-        d1 = self.dec1(d1)
-
-        out = self.final_conv(d1)
-        out = self.final_act(out)
+        if return_latent:
+            return out, latent
         return out
-
-    def forward(self, x: torch.Tensor):
-        skips, z = self.encode(x)
-        recon = self.decode(skips, z)
-        return recon, z
-
-
-# ------------------------
-# Factory
-# ------------------------
-
-def create_model():
-    # we keep the same API: either VAE or "not VAE"
-    # but for quality, we just use UNetDenoiser (is_vae = False)
-    model = UNetDenoiser(
-        img_size=IMG_SIZE,
-        in_channels=IN_CHANNELS,
-        base_channels=32,
-        latent_dim=LATENT_DIM,
-    ).to(device)
-    return model
