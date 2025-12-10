@@ -6,10 +6,10 @@ from torch import nn
 # ------------------------
 # Global config
 # ------------------------
-IMG_SIZE = 64          # 64 or 128 (must be power-of-two)
-IN_CHANNELS = 1        # 1 = grayscale
-LATENT_DIM = 128       # bottleneck vector length
-MODEL_TYPE = "vae"     # "vae" эсвэл "ae"
+IMG_SIZE = 64          # 64 is fine for MNIST-style digits
+IN_CHANNELS = 1        # grayscale
+LATENT_DIM = 256       # size of latent vector shown in UI
+MODEL_TYPE = "ae"      # we now use a deterministic denoising AE
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -21,168 +21,134 @@ def _check_img_size(img_size: int):
         raise ValueError("IMG_SIZE should be >= 32 for this architecture.")
 
 
-def _make_encoder(in_channels: int, base_channels: int, img_size: int):
-    """
-    Convolutional encoder: img_size -> 4x4 хүртэл downsample.
-    Returns (nn.Sequential, last_channels, feature_size)
-    """
-    _check_img_size(img_size)
-
-    # final feature map size 4x4 болтол stride=2 conv хийнэ
-    num_down = int(math.log2(img_size) - 2)  # e.g. 64 -> 4 downs, 128 -> 5 downs
-    layers = []
-    ch = in_channels
-    for i in range(num_down):
-        out_ch = base_channels * (2 ** i)
-        layers.append(nn.Conv2d(ch, out_ch, kernel_size=3, stride=2, padding=1))
-        layers.append(nn.BatchNorm2d(out_ch))
-        layers.append(nn.ReLU(inplace=True))
-        ch = out_ch
-
-    encoder = nn.Sequential(*layers)
-    feat_size = img_size // (2 ** num_down)  # should be 4
-    return encoder, ch, feat_size
-
-
-def _make_decoder(last_ch: int, base_channels: int, img_size: int, out_channels: int):
-    """
-    Transposed-conv decoder: 4x4 -> img_size
-    """
-    _check_img_size(img_size)
-    num_up = int(math.log2(img_size) - 2)
-
-    layers = []
-    ch = last_ch
-    for i in reversed(range(num_up)):
-        out_ch = base_channels * (2 ** i)
-        layers.append(
-            nn.ConvTranspose2d(
-                ch,
-                out_ch,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                output_padding=1,
-            )
-        )
-        layers.append(nn.BatchNorm2d(out_ch))
-        layers.append(nn.ReLU(inplace=True))
-        ch = out_ch
-
-    # final conv to 1 channel, sigmoid [0,1]
-    layers.append(nn.Conv2d(ch, out_channels, kernel_size=3, padding=1))
-    layers.append(nn.Sigmoid())
-
-    return nn.Sequential(*layers)
-
-
 # ------------------------
-# Plain Denoising Autoencoder
+# Basic building blocks
 # ------------------------
 
-class DenoisingAutoencoder(nn.Module):
-    def __init__(self,
-                 img_size: int = IMG_SIZE,
-                 in_channels: int = IN_CHANNELS,
-                 latent_dim: int = LATENT_DIM,
-                 base_channels: int = 32):
+class ConvBlock(nn.Module):
+    """
+    Conv -> BN -> ReLU (×2)
+    """
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        self.img_size = img_size
-        self.in_channels = in_channels
-        self.latent_dim = latent_dim
-        self.base_channels = base_channels
-        self.is_vae = False
-
-        self.encoder_conv, last_ch, feat_size = _make_encoder(
-            in_channels, base_channels, img_size
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
         )
-        self.feature_shape = (last_ch, feat_size, feat_size)
-        self.flat_dim = last_ch * feat_size * feat_size
 
-        self.fc_enc = nn.Linear(self.flat_dim, latent_dim)
-        self.fc_dec = nn.Linear(latent_dim, self.flat_dim)
-
-        self.decoder_conv = _make_decoder(last_ch, base_channels, img_size, in_channels)
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.encoder_conv(x)
-        h_flat = h.view(h.size(0), -1)
-        z = self.fc_enc(h_flat)
-        return z
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        h_flat = self.fc_dec(z)
-        h = h_flat.view(-1, *self.feature_shape)
-        out = self.decoder_conv(h)
-        return out
-
-    def forward(self, x: torch.Tensor):
-        z = self.encode(x)
-        out = self.decode(z)
-        return out, z
+    def forward(self, x):
+        return self.net(x)
 
 
 # ------------------------
-# Denoising Variational Autoencoder (VAE)
+# U-Net style denoiser
 # ------------------------
 
-class DenoisingVAE(nn.Module):
+class UNetDenoiser(nn.Module):
     """
-    Conv-based Denoising VAE.
-      Input:  (B, 1, H, W)
-      Latent: (B, LATENT_DIM)
-      Output: (B, 1, H, W)
+    Lightweight U-Net for denoising digits.
+
+    Input:  (B, 1, H, W)
+    Output: (B, 1, H, W)  in [0,1]
+    Latent: (B, LATENT_DIM)
     """
 
     def __init__(self,
                  img_size: int = IMG_SIZE,
                  in_channels: int = IN_CHANNELS,
-                 latent_dim: int = LATENT_DIM,
-                 base_channels: int = 32):
+                 base_channels: int = 32,
+                 latent_dim: int = LATENT_DIM):
         super().__init__()
+        _check_img_size(img_size)
+
         self.img_size = img_size
         self.in_channels = in_channels
         self.latent_dim = latent_dim
-        self.base_channels = base_channels
-        self.is_vae = True
+        self.is_vae = False   # so train.py knows we are plain AE
 
-        self.encoder_conv, last_ch, feat_size = _make_encoder(
-            in_channels, base_channels, img_size
-        )
-        self.feature_shape = (last_ch, feat_size, feat_size)
-        self.flat_dim = last_ch * feat_size * feat_size
+        # ------- Encoder -------
+        self.enc1 = ConvBlock(in_channels, base_channels)         # 64x64 -> 64x64
+        self.down1 = nn.Conv2d(base_channels, base_channels * 2,
+                               kernel_size=3, stride=2, padding=1)  # 64 -> 32
 
-        # q(z | x)
-        self.fc_mu = nn.Linear(self.flat_dim, latent_dim)
-        self.fc_logvar = nn.Linear(self.flat_dim, latent_dim)
+        self.enc2 = ConvBlock(base_channels * 2, base_channels * 2)  # 32x32
+        self.down2 = nn.Conv2d(base_channels * 2, base_channels * 4,
+                               kernel_size=3, stride=2, padding=1)  # 32 -> 16
 
-        # p(x | z)
-        self.fc_dec = nn.Linear(latent_dim, self.flat_dim)
-        self.decoder_conv = _make_decoder(last_ch, base_channels, img_size, in_channels)
+        self.enc3 = ConvBlock(base_channels * 4, base_channels * 4)  # 16x16
+        self.down3 = nn.Conv2d(base_channels * 4, base_channels * 8,
+                               kernel_size=3, stride=2, padding=1)  # 16 -> 8
+
+        # bottleneck 8x8
+        self.bottleneck = ConvBlock(base_channels * 8, base_channels * 8)
+
+        # latent from global average pooled bottleneck
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc_latent = nn.Linear(base_channels * 8, latent_dim)
+
+        # ------- Decoder -------
+        self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4,
+                                      kernel_size=3, stride=2, padding=1, output_padding=1)  # 8 -> 16
+        self.dec3 = ConvBlock(base_channels * 4 + base_channels * 4, base_channels * 4)
+
+        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2,
+                                      kernel_size=3, stride=2, padding=1, output_padding=1)  # 16 -> 32
+        self.dec2 = ConvBlock(base_channels * 2 + base_channels * 2, base_channels * 2)
+
+        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels,
+                                      kernel_size=3, stride=2, padding=1, output_padding=1)  # 32 -> 64
+        self.dec1 = ConvBlock(base_channels + base_channels, base_channels)
+
+        # final prediction
+        self.final_conv = nn.Conv2d(base_channels, in_channels, kernel_size=3, padding=1)
+        self.final_act = nn.Sigmoid()
 
     def encode(self, x: torch.Tensor):
-        h = self.encoder_conv(x)
-        h_flat = h.view(h.size(0), -1)
-        mu = self.fc_mu(h_flat)
-        logvar = self.fc_logvar(h_flat)
-        return mu, logvar
+        # encoder with skip connections
+        x1 = self.enc1(x)                  # (B, 32, 64, 64)
+        x2_in = torch.relu(self.down1(x1))
+        x2 = self.enc2(x2_in)              # (B, 64, 32, 32)
 
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+        x3_in = torch.relu(self.down2(x2))
+        x3 = self.enc3(x3_in)              # (B, 128, 16, 16)
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        h_flat = self.fc_dec(z)
-        h = h_flat.view(-1, *self.feature_shape)
-        out = self.decoder_conv(h)
+        x4_in = torch.relu(self.down3(x3))
+        bottleneck = self.bottleneck(x4_in)  # (B, 256, 8, 8)
+
+        # latent vector via global avg pool
+        gap = self.gap(bottleneck).view(bottleneck.size(0), -1)  # (B, 256)
+        z = self.fc_latent(gap)                                  # (B, LATENT_DIM)
+
+        return (x1, x2, x3, bottleneck), z
+
+    def decode(self, skips, z: torch.Tensor):
+        x1, x2, x3, bottleneck = skips
+
+        # decoder with skip concatenations
+        d3 = self.up3(bottleneck)          # (B, 128, 16, 16)
+        d3 = torch.cat([d3, x3], dim=1)    # concat skip
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)                  # (B, 64, 32, 32)
+        d2 = torch.cat([d2, x2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)                  # (B, 32, 64, 64)
+        d1 = torch.cat([d1, x1], dim=1)
+        d1 = self.dec1(d1)
+
+        out = self.final_conv(d1)
+        out = self.final_act(out)
         return out
 
     def forward(self, x: torch.Tensor):
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        recon = self.decode(z)
-        return recon, z, mu, logvar
+        skips, z = self.encode(x)
+        recon = self.decode(skips, z)
+        return recon, z
 
 
 # ------------------------
@@ -190,15 +156,12 @@ class DenoisingVAE(nn.Module):
 # ------------------------
 
 def create_model():
-    if MODEL_TYPE.lower() == "vae":
-        return DenoisingVAE(
-            img_size=IMG_SIZE,
-            in_channels=IN_CHANNELS,
-            latent_dim=LATENT_DIM,
-        ).to(device)
-    else:
-        return DenoisingAutoencoder(
-            img_size=IMG_SIZE,
-            in_channels=IN_CHANNELS,
-            latent_dim=LATENT_DIM,
-        ).to(device)
+    # we keep the same API: either VAE or "not VAE"
+    # but for quality, we just use UNetDenoiser (is_vae = False)
+    model = UNetDenoiser(
+        img_size=IMG_SIZE,
+        in_channels=IN_CHANNELS,
+        base_channels=32,
+        latent_dim=LATENT_DIM,
+    ).to(device)
+    return model

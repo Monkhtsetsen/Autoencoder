@@ -4,14 +4,13 @@ import math
 from typing import Tuple, Dict
 
 import torch
-from torch import nn, optim
+from torch import optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import datasets, transforms as T
 import matplotlib.pyplot as plt
 
 from model import create_model, IMG_SIZE, IN_CHANNELS, LATENT_DIM, MODEL_TYPE, device
-
 
 # ------------------------
 # Dataset: high-res noisy handwriting
@@ -24,7 +23,7 @@ class NoisyMNISTHighRes(Dataset):
     """
 
     def __init__(self, root: str = "data", train: bool = True,
-                 noise_std: float = 0.4):
+                 noise_std: float = 0.25):
         super().__init__()
 
         transform_clean = T.Compose([
@@ -40,10 +39,14 @@ class NoisyMNISTHighRes(Dataset):
         )
 
         self.noise_std = noise_std
-        # Blur + random affine – бичмэл үсгийн real world distortion-тэй төстэй болгоно.
+        # blur + mild affine, similar to "a bit shaky / blurry" handwriting
         self.augment = T.Compose([
-            T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
-            T.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=(0.9, 1.1)),
+            T.GaussianBlur(kernel_size=3, sigma=(0.5, 1.2)),
+            T.RandomAffine(
+                degrees=5,
+                translate=(0.03, 0.03),
+                scale=(0.95, 1.05),
+            ),
         ])
 
     def __len__(self):
@@ -52,17 +55,74 @@ class NoisyMNISTHighRes(Dataset):
     def __getitem__(self, idx: int):
         clean, _ = self.base[idx]           # (1,H,W)
         aug = self.augment(clean)
-        noise = torch.randn_like(aug) * self.noise_std
+
+        # random noise strength per sample → more robust
+        factor = 0.5 + torch.rand(1).item()   # [0.5, 1.5]
+        noise = torch.randn_like(aug) * self.noise_std * factor
+
         noisy = (aug + noise).clamp(0.0, 1.0)
         return noisy, clean
 
 
 # ------------------------
-# Metrics
+# Metrics & perceptual loss
 # ------------------------
 
-def mse_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    return torch.mean((x - y) ** 2)
+def _gaussian_window(window_size: int, sigma: float,
+                     device, dtype) -> torch.Tensor:
+    coords = torch.arange(window_size, dtype=dtype, device=device) - window_size // 2
+    gauss_1d = torch.exp(- (coords ** 2) / (2 * sigma ** 2))
+    gauss_1d = gauss_1d / gauss_1d.sum()
+    gauss_2d = gauss_1d.unsqueeze(1) @ gauss_1d.unsqueeze(0)
+    window = gauss_2d.unsqueeze(0).unsqueeze(0)  # (1,1,K,K)
+    return window
+
+
+def ssim(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+    """
+    Structural Similarity Index (SSIM) for grayscale images in [0,1].
+    x, y: (B, C, H, W)
+    Returns mean SSIM over batch.
+    """
+    assert x.shape == y.shape, "SSIM: shapes must match"
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    B, C, H, W = x.shape
+    window = _gaussian_window(
+        window_size=window_size,
+        sigma=1.5,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    window = window.expand(C, 1, window_size, window_size)
+
+    mu_x = F.conv2d(x, window, padding=window_size // 2, groups=C)
+    mu_y = F.conv2d(y, window, padding=window_size // 2, groups=C)
+
+    mu_x2 = mu_x * mu_x
+    mu_y2 = mu_y * mu_y
+    mu_xy = mu_x * mu_y
+
+    sigma_x2 = F.conv2d(x * x, window, padding=window_size // 2, groups=C) - mu_x2
+    sigma_y2 = F.conv2d(y * y, window, padding=window_size // 2, groups=C) - mu_y2
+    sigma_xy = F.conv2d(x * y, window, padding=window_size // 2, groups=C) - mu_xy
+
+    ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / (
+        (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2)
+    )
+    return ssim_map.mean()
+
+
+def mse_loss_with_ssim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    L = 0.7 * MSE + 0.3 * (1 - SSIM)
+    """
+    mse = torch.mean((x - y) ** 2)
+    ssim_val = ssim(x, y)
+    loss = 0.7 * mse + 0.3 * (1.0 - ssim_val)
+    return loss
 
 
 def psnr(x: torch.Tensor, y: torch.Tensor) -> float:
@@ -72,28 +132,13 @@ def psnr(x: torch.Tensor, y: torch.Tensor) -> float:
     return 10.0 * math.log10(1.0 / mse)
 
 
-def vae_loss(recon: torch.Tensor,
-             target: torch.Tensor,
-             mu: torch.Tensor,
-             logvar: torch.Tensor,
-             beta_kl: float = 1e-3) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    recon: model output
-    target: clean image
-    """
-    rec = F.mse_loss(recon, target, reduction="mean")
-    kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    loss = rec + beta_kl * kl
-    return loss, rec.detach(), kl.detach()
-
-
 # ------------------------
 # Training / Eval loops
 # ------------------------
 
 def train_epoch(model, loader, optimizer, epoch, total_epochs) -> Dict:
     model.train()
-    totals = {"loss": 0.0, "rec": 0.0, "kl": 0.0, "psnr": 0.0}
+    totals = {"loss": 0.0, "psnr": 0.0}
     n_batches = 0
 
     for noisy, clean in loader:
@@ -102,21 +147,14 @@ def train_epoch(model, loader, optimizer, epoch, total_epochs) -> Dict:
 
         optimizer.zero_grad()
 
-        if getattr(model, "is_vae", False):
-            recon, z, mu, logvar = model(noisy)
-            loss, rec, kl = vae_loss(recon, clean, mu, logvar, beta_kl=1e-3)
-        else:
-            recon, z = model(noisy)
-            loss = mse_loss(recon, clean)
-            rec = loss.detach()
-            kl = torch.tensor(0.0)
+        recon, z = model(noisy)
+        loss = mse_loss_with_ssim(recon, clean)
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         totals["loss"] += loss.item()
-        totals["rec"] += rec.item()
-        totals["kl"] += kl.item()
         totals["psnr"] += psnr(recon.detach(), clean)
         n_batches += 1
 
@@ -124,15 +162,14 @@ def train_epoch(model, loader, optimizer, epoch, total_epochs) -> Dict:
         totals[k] /= n_batches
 
     print(f"[Train] Epoch {epoch}/{total_epochs} | "
-          f"loss={totals['loss']:.6f} | rec={totals['rec']:.6f} | "
-          f"kl={totals['kl']:.6f} | psnr={totals['psnr']:.2f} dB")
+          f"loss={totals['loss']:.6f} | psnr={totals['psnr']:.2f} dB")
 
     return totals
 
 
 def eval_epoch(model, loader, epoch, total_epochs) -> Dict:
     model.eval()
-    totals = {"loss": 0.0, "rec": 0.0, "kl": 0.0, "psnr": 0.0}
+    totals = {"loss": 0.0, "psnr": 0.0}
     n_batches = 0
 
     with torch.no_grad():
@@ -140,18 +177,10 @@ def eval_epoch(model, loader, epoch, total_epochs) -> Dict:
             noisy = noisy.to(device)
             clean = clean.to(device)
 
-            if getattr(model, "is_vae", False):
-                recon, z, mu, logvar = model(noisy)
-                loss, rec, kl = vae_loss(recon, clean, mu, logvar, beta_kl=1e-3)
-            else:
-                recon, z = model(noisy)
-                loss = mse_loss(recon, clean)
-                rec = loss.detach()
-                kl = torch.tensor(0.0)
+            recon, z = model(noisy)
+            loss = mse_loss_with_ssim(recon, clean)
 
             totals["loss"] += loss.item()
-            totals["rec"] += rec.item()
-            totals["kl"] += kl.item()
             totals["psnr"] += psnr(recon, clean)
             n_batches += 1
 
@@ -159,8 +188,7 @@ def eval_epoch(model, loader, epoch, total_epochs) -> Dict:
         totals[k] /= n_batches
 
     print(f"[Valid] Epoch {epoch}/{total_epochs} | "
-          f"loss={totals['loss']:.6f} | rec={totals['rec']:.6f} | "
-          f"kl={totals['kl']:.6f} | psnr={totals['psnr']:.2f} dB")
+          f"loss={totals['loss']:.6f} | psnr={totals['psnr']:.2f} dB")
 
     return totals
 
@@ -192,16 +220,12 @@ def save_sample_grid(model, loader, path: str = "samples.png", n_samples: int = 
     clean_batch = clean_batch[:n_samples].to(device)
 
     with torch.no_grad():
-        if getattr(model, "is_vae", False):
-            recon_batch, _, _, _ = model(noisy_batch)
-        else:
-            recon_batch, _ = model(noisy_batch)
+        recon_batch, _ = model(noisy_batch)
 
     noisy = noisy_batch.cpu().numpy()
     clean = clean_batch.cpu().numpy()
     recon = recon_batch.cpu().numpy()
 
-    # 3 rows × n_samples: Noisy / Denoised / Clean
     fig, axes = plt.subplots(3, n_samples, figsize=(2.2 * n_samples, 6))
     titles = ["Noisy", "Denoised", "Clean"]
 
@@ -231,19 +255,26 @@ def save_sample_grid(model, loader, path: str = "samples.png", n_samples: int = 
 def main():
     os.makedirs("weights", exist_ok=True)
 
-    full_train = NoisyMNISTHighRes(root="data", train=True, noise_std=0.4)
+    full_train = NoisyMNISTHighRes(root="data", train=True, noise_std=0.25)
+
+    # use subset so training stays reasonable
+    max_samples = 20000
+    if len(full_train) > max_samples:
+        full_train, _ = random_split(full_train, [max_samples, len(full_train) - max_samples])
+        print(f"[INFO] Using subset of MNIST: {max_samples} samples")
 
     train_size = int(0.9 * len(full_train))
     val_size = len(full_train) - train_size
     train_ds, val_ds = random_split(full_train, [train_size, val_size])
 
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=128, shuffle=False, num_workers=0)
+    batch_size = 64 if device.type == "cpu" else 128
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     model = create_model()
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-    num_epochs = 25
+    num_epochs = 10
     best_val_loss = float("inf")
     history = {"train_loss": [], "val_loss": []}
     weights_path = f"weights/mnist_{MODEL_TYPE}_denoiser_{IMG_SIZE}.pth"

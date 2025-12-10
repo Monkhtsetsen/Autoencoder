@@ -56,14 +56,17 @@ def load_curve(path):
 
 
 def run_model_on_pil(pil_img: Image.Image):
+    # 1) grayscale + resize to model input size
     gray = pil_img.convert("L")
     gray = resize_to_model(gray)
 
-    x = to_tensor(gray)  # (1,H,W)
-    if x.mean().item() > 0.5:
-        x = 1.0 - x  # background-ийг approximate MNIST style
+    x = to_tensor(gray)  # (1,H,W) in [0,1]
 
-    x = x.unsqueeze(0).to(device)
+    # invert if background is white-ish (MNIST-style)
+    if x.mean().item() > 0.5:
+        x = 1.0 - x
+
+    x = x.unsqueeze(0).to(device)  # (1,1,H,W)
 
     with torch.no_grad():
         if getattr(model, "is_vae", False):
@@ -76,11 +79,13 @@ def run_model_on_pil(pil_img: Image.Image):
     recon_cpu = recon[0].cpu().clamp(0.0, 1.0)
     z_cpu = z[0].cpu()
 
+    # error map
     diff = (x_cpu - recon_cpu).abs()
     max_val = diff.max().item()
     if max_val > 1e-8:
         diff = diff / max_val
 
+    # upscale for nicer display
     upscale = T.Resize((256, 256))
     orig_pil = upscale(to_pil_image(x_cpu))
     recon_pil = upscale(to_pil_image(recon_cpu))
@@ -220,6 +225,24 @@ HTML_PAGE = """
     .status { margin-top: 10px; font-size: 12px; color: #9ca3af; }
     .error { margin-top: 10px; font-size: 12px; color: #f97373; }
     .curve-panel { margin-top: 16px; }
+    .download-row {
+      margin-top: 12px;
+      display: flex;
+      justify-content: flex-end;
+    }
+    .btn-secondary {
+      padding: 7px 16px;
+      border-radius: 999px;
+      border: 1px solid #4b5563;
+      background: transparent;
+      color: #e5e7eb;
+      font-size: 13px;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .btn-secondary:hover {
+      background: #111827;
+    }
     @media (max-width: 900px) { .grid-main { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -265,6 +288,11 @@ HTML_PAGE = """
             </div>
             <div class="status">
               Error map дээр цайвар хэсэг = алдаа ихтэй пиксел, бараан хэсэг = сайн reconstruction.
+            </div>
+            <div class="download-row">
+              <a class="btn-secondary" href="{{ recon_img }}" download="denoised.png">
+                Denoised зураг татаж авах
+              </a>
             </div>
           </div>
 
