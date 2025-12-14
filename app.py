@@ -1,4 +1,3 @@
-# app.py
 import os
 import io
 import base64
@@ -118,149 +117,263 @@ HTML_PAGE = """
   <meta charset="utf-8" />
   <title>{{ model_type }} Denoising ({{ img_size }}×{{ img_size }})</title>
   <style>
+    :root {
+      --pink-bg-light: #ffe6f2;
+      --pink-bg-mid: #ffd6ea;
+      --pink-bg-card: #fff0f6;
+      --pink-border: #f9a8d4;
+      --pink-soft: #ffe4f0;
+      --pink-pill: #ffeaf3;
+      --pink-text-main: #4b1f3f;
+      --pink-text-soft: #9f1239;
+      --pink-muted: #be185d;
+      --pink-btn-from: #f9a8d4;
+      --pink-btn-to: #fb7185;
+      --pink-shadow: rgba(244, 114, 182, 0.45);
+      --pink-error: #e11d48;
+    }
+
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: radial-gradient(circle at top, #020617, #000000);
-      color: #e5e7eb;
+      background: radial-gradient(circle at top, var(--pink-bg-light), var(--pink-bg-mid));
+      color: var(--pink-text-main);
       margin: 0;
       padding: 0;
       display: flex;
       justify-content: center;
       min-height: 100vh;
     }
-    .container { max-width: 1100px; width: 100%; padding: 24px; }
-    .card {
-      background: rgba(15, 23, 42, 0.95);
-      border-radius: 18px;
-      padding: 20px 24px 24px;
-      border: 1px solid #1f2937;
-      box-shadow: 0 28px 80px rgba(15, 23, 42, 0.9);
-      backdrop-filter: blur(16px);
+
+    .container {
+      max-width: 1100px;
+      width: 100%;
+      padding: 24px;
     }
+
+    .card {
+      background: var(--pink-bg-card);
+      border-radius: 22px;
+      padding: 22px 26px 26px;
+      border: 1px solid var(--pink-border);
+      box-shadow: 0 22px 60px var(--pink-shadow);
+      backdrop-filter: blur(20px);
+    }
+
     h1 {
       margin-top: 0;
       font-size: 24px;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.08em;
       text-transform: uppercase;
+      color: var(--pink-text-main);
     }
-    p { color: #9ca3af; font-size: 14px; margin-top: 4px; }
-    .pill-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+
+    p {
+      color: var(--pink-text-soft);
+      font-size: 14px;
+      margin-top: 4px;
+    }
+
+    .pill-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+
     .pill {
       font-size: 11px;
       text-transform: uppercase;
       letter-spacing: 0.1em;
       padding: 4px 10px;
       border-radius: 999px;
-      background: #020617;
-      border: 1px solid #1f2937;
-      color: #9ca3af;
+      background: var(--pink-pill);
+      border: 1px solid var(--pink-border);
+      color: var(--pink-muted);
     }
+
     .upload-box {
       margin-top: 18px;
       padding: 16px;
-      border-radius: 14px;
-      border: 1px dashed #334155;
-      background: #020617;
+      border-radius: 16px;
+      border: 1px dashed var(--pink-border);
+      background: var(--pink-soft);
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 16px;
       flex-wrap: wrap;
     }
-    input[type=file] { color: #e5e7eb; font-size: 14px; }
+
+    input[type=file] {
+      color: var(--pink-text-main);
+      font-size: 14px;
+    }
+
     .btn {
       padding: 9px 20px;
       border-radius: 999px;
       border: none;
       cursor: pointer;
-      background: linear-gradient(135deg, #6366f1, #22c55e);
-      color: #020617;
+      background: linear-gradient(135deg, var(--pink-btn-from), var(--pink-btn-to));
+      color: #fff;
       font-weight: 600;
       font-size: 14px;
-      box-shadow: 0 10px 25px rgba(79,70,229,0.4);
+      box-shadow: 0 10px 25px var(--pink-shadow);
       white-space: nowrap;
+      transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease;
     }
-    .btn:hover { opacity: 0.94; transform: translateY(-1px); }
+
+    .btn:hover {
+      opacity: 0.96;
+      transform: translateY(-1px);
+      box-shadow: 0 14px 35px var(--pink-shadow);
+    }
+
     .grid-main {
       display: grid;
       grid-template-columns: 2fr 1fr;
       gap: 18px;
       margin-top: 22px;
     }
+
     .panel {
-      background: #020617;
-      border-radius: 14px;
-      border: 1px solid #1f2937;
+      background: #fff7fb;
+      border-radius: 16px;
+      border: 1px solid var(--pink-border);
       padding: 14px 14px 16px;
     }
+
     .panel h2 {
       font-size: 13px;
       font-weight: 600;
       margin: 0 0 8px 0;
-      color: #e5e7eb;
+      color: var(--pink-text-main);
       letter-spacing: 0.08em;
       text-transform: uppercase;
     }
-    .panel small { color: #6b7280; font-size: 11px; }
+
+    .panel small {
+      color: var(--pink-text-soft);
+      font-size: 11px;
+    }
+
     .img-wrapper {
       margin-top: 10px;
       display: flex;
       justify-content: center;
       align-items: center;
-      background: radial-gradient(circle at top, #111827, #020617);
-      border-radius: 12px;
+      background: radial-gradient(circle at top, #ffe4f0, #fed7e2);
+      border-radius: 14px;
       overflow: hidden;
       min-height: 220px;
-      border: 1px solid #111827;
+      border: 1px solid var(--pink-border);
     }
-    .img-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); width: 100%; }
-    .img-wrapper img { max-width: 100%; height: auto; display: block; }
-    .metric-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+
+    .img-grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      width: 100%;
+    }
+
+    .img-wrapper img {
+      max-width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    .metric-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+
     .metric-pill {
       font-size: 12px;
       padding: 6px 10px;
       border-radius: 999px;
-      background: #020617;
-      border: 1px solid #1f2937;
-      color: #e5e7eb;
+      background: #ffeaf3;
+      border: 1px solid var(--pink-border);
+      color: var(--pink-text-main);
     }
-    .metric-pill span { color: #9ca3af; font-size: 11px; }
+
+    .metric-pill span {
+      color: var(--pink-muted);
+      font-size: 11px;
+      margin-right: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
     .latent-box {
       font-family: "JetBrains Mono", "Fira Code", monospace;
       font-size: 11px;
-      background: #020617;
-      border-radius: 10px;
+      background: #fff;
+      border-radius: 12px;
       padding: 10px 12px;
       overflow-x: auto;
-      border: 1px solid #1f2937;
+      border: 1px solid var(--pink-border);
       white-space: pre-wrap;
       word-break: break-all;
       max-height: 260px;
+      color: var(--pink-text-main);
     }
-    details { margin-top: 8px; }
-    summary { cursor: pointer; color: #9ca3af; font-size: 12px; }
-    .status { margin-top: 10px; font-size: 12px; color: #9ca3af; }
-    .error { margin-top: 10px; font-size: 12px; color: #f97373; }
-    .curve-panel { margin-top: 16px; }
+
+    details {
+      margin-top: 8px;
+    }
+
+    summary {
+      cursor: pointer;
+      color: var(--pink-muted);
+      font-size: 12px;
+    }
+
+    .status {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--pink-text-soft);
+    }
+
+    .error {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--pink-error);
+      font-weight: 500;
+    }
+
+    .curve-panel {
+      margin-top: 16px;
+    }
+
     .download-row {
       margin-top: 12px;
       display: flex;
       justify-content: flex-end;
     }
+
     .btn-secondary {
       padding: 7px 16px;
       border-radius: 999px;
-      border: 1px solid #4b5563;
-      background: transparent;
-      color: #e5e7eb;
+      border: 1px solid var(--pink-border);
+      background: #ffeaf3;
+      color: var(--pink-text-main);
       font-size: 13px;
       cursor: pointer;
       text-decoration: none;
+      transition: background 0.12s ease, transform 0.12s ease;
     }
+
     .btn-secondary:hover {
-      background: #111827;
+      background: #ffd6ea;
+      transform: translateY(-1px);
     }
-    @media (max-width: 900px) { .grid-main { grid-template-columns: 1fr; } }
+
+    @media (max-width: 900px) {
+      .grid-main {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 </head>
 <body>
@@ -450,4 +563,5 @@ def _render_with_error(error_msg: str):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
